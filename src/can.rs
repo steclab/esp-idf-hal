@@ -385,7 +385,14 @@ pub enum Alert {
 }
 
 /// CAN abstraction
-pub struct CanDriver<'d>(PeripheralRef<'d, CAN>, EnumSet<Alert>, bool);
+pub struct CanDriver<'d> {
+    can: PeripheralRef<'d, CAN>,
+    alerts: EnumSet<Alert>,
+    has_tx_queue: bool,
+    config: config::Config,
+    tx_pin: i32,
+    rx_pin: i32,
+}
 
 impl<'d> CanDriver<'d> {
     pub fn new(
@@ -395,26 +402,43 @@ impl<'d> CanDriver<'d> {
         config: &config::Config,
     ) -> Result<Self, EspError> {
         crate::into_ref!(can, tx, rx);
+        let tx_pin = tx.pin();
+        let rx_pin = rx.pin();
 
+        let driver = Self {
+            can,
+            alerts: config.alerts,
+            has_tx_queue: config.tx_queue_len > 0,
+            config: config.clone(),
+            tx_pin,
+            rx_pin,
+        };
+
+        driver.install_driver()?;
+
+        Ok(driver)
+    }
+
+    fn install_driver(&self) -> Result<(), EspError> {
         #[allow(clippy::needless_update)]
         let general_config = twai_general_config_t {
-            mode: config.mode.into(),
-            tx_io: tx.pin(),
-            rx_io: rx.pin(),
+            mode: self.config.mode.into(),
+            tx_io: self.tx_pin,
+            rx_io: self.rx_pin,
             clkout_io: -1,
             bus_off_io: -1,
-            tx_queue_len: config.tx_queue_len,
-            rx_queue_len: config.rx_queue_len,
-            alerts_enabled: config.alerts.as_repr(),
+            tx_queue_len: self.config.tx_queue_len,
+            rx_queue_len: self.config.rx_queue_len,
+            alerts_enabled: self.config.alerts.as_repr(),
             clkout_divider: 0,
-            intr_flags: InterruptType::to_native(config.intr_flags) as _,
+            intr_flags: InterruptType::to_native(self.config.intr_flags) as _,
             ..Default::default()
         };
 
-        let timing_config = config.timing.into();
+        let timing_config = self.config.timing.into();
 
         // modify filter and mask to be compatible with TWAI acceptance filter
-        let (filter, mask, single_filter) = match config.filter {
+        let (filter, mask, single_filter) = match self.config.filter {
             config::Filter::Standard { filter, mask } => {
                 ((filter as u32) << 21, !((mask as u32) << 21), true)
             }
@@ -437,9 +461,27 @@ impl<'d> CanDriver<'d> {
             single_filter,
         };
 
-        esp!(unsafe { twai_driver_install(&general_config, &timing_config, &filter_config) })?;
+        esp!(unsafe { twai_driver_install(&general_config, &timing_config, &filter_config) })
+    }
 
-        Ok(Self(can, config.alerts, config.tx_queue_len > 0))
+    /// Reconfigure the CAN bus timing (baud rate)
+    pub fn set_timing(&mut self, timing: config::Timing) -> Result<(), EspError> {
+        self.stop()?;
+        esp!(unsafe { twai_driver_uninstall() })?;
+        
+        self.config.timing = timing;
+        self.install_driver()?;
+        self.start()
+    }
+
+    /// Reconfigure the CAN bus filter
+    pub fn set_filter(&mut self, filter: config::Filter) -> Result<(), EspError> {
+        self.stop()?;
+        esp!(unsafe { twai_driver_uninstall() })?;
+        
+        self.config.filter = filter;
+        self.install_driver()?;
+        self.start()
     }
 
     pub fn start(&mut self) -> Result<(), EspError> {
@@ -601,7 +643,7 @@ where
             twai_reconfigure_alerts(
                 driver
                     .borrow()
-                    .1
+                    .alerts
                     .union(read_alerts())
                     .union(write_alerts())
                     .as_repr(),
@@ -643,6 +685,16 @@ where
         self.driver.borrow_mut().stop()
     }
 
+    /// Reconfigure the CAN bus timing (baud rate)
+    pub fn set_timing(&mut self, timing: config::Timing) -> Result<(), EspError> {
+        self.driver.borrow_mut().set_timing(timing)
+    }
+
+    /// Reconfigure the CAN bus filter
+    pub fn set_filter(&mut self, filter: config::Filter) -> Result<(), EspError> {
+        self.driver.borrow_mut().set_filter(filter)
+    }
+
     pub async fn transmit(&self, frame: &Frame) -> Result<(), EspError> {
         loop {
             let res = self.driver.borrow().transmit(frame, delay::NON_BLOCK);
@@ -651,7 +703,7 @@ where
                 Ok(()) => return Ok(()),
                 Err(e)
                     if e.code() != ESP_ERR_TIMEOUT
-                        && (e.code() != ESP_FAIL || self.driver.borrow().2) =>
+                        && (e.code() != ESP_FAIL || self.driver.borrow().has_tx_queue) =>
                 {
                     return Err(e)
                 }
@@ -679,7 +731,7 @@ where
     pub async fn read_alerts(&self) -> Result<EnumSet<Alert>, EspError> {
         let alerts = loop {
             let alerts = EnumSet::from_repr(ALERT_NOTIFICATION.wait().await.into())
-                .intersection(self.driver.borrow().1);
+                .intersection(self.driver.borrow().alerts);
 
             if !alerts.is_empty() {
                 break alerts;
@@ -722,7 +774,7 @@ where
         unsafe { task::destroy(self.task) };
 
         let mut alerts = 0;
-        esp!(unsafe { twai_reconfigure_alerts(self.driver.borrow().1.as_repr(), &mut alerts) })
+        esp!(unsafe { twai_reconfigure_alerts(self.driver.borrow().alerts.as_repr(), &mut alerts) })
             .unwrap();
 
         READ_NOTIFICATION.reset();
